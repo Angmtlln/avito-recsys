@@ -69,6 +69,12 @@ def load_table(name: str) -> pd.DataFrame:
     return pd.read_parquet(config.RAW_DIR / "db" / f"{name}.parquet")
 
 
+def load_ads() -> pd.DataFrame:
+    """Читает категорию и регион каждого объявления."""
+    ads = load_table("AdsInfo")[["AdID", "CategoryID", "LocationID"]]
+    return ads.merge(load_table("Location")[["LocationID", "RegionID"]], on="LocationID", how="left")
+
+
 def load_task_table(split: str) -> pd.DataFrame:
     """Читает таблицу задачи для сплита train, val или test."""
     return pd.read_parquet(config.RAW_DIR / "task" / f"{split}.parquet")

@@ -12,6 +12,7 @@ dependencies = [
     "pandas>=2.1",
     "pyarrow>=14",
     "relbench>=2.0",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]

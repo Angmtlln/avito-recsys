@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 SECONDS_PER_DAY = 86_400
 
@@ -42,6 +43,17 @@ def _ranked_ads(ad_scores: pd.Series) -> np.ndarray:
     return ad_scores.index.to_numpy()[np.lexsort((ad_scores.index.to_numpy(), -ad_scores.to_numpy()))]
 
 
+def _decayed_scores(events: pd.DataFrame, cutoff: pd.Timestamp, half_life_days: float) -> pd.DataFrame:
+    """Складывает веса событий по парам user_id, ad_id. Вес падает вдвое каждые half_life_days дней.
+
+    Объявления каждого пользователя отсортированы по убыванию скора, при равенстве по id.
+    """
+    age_days = (cutoff - events.ts).dt.total_seconds() / SECONDS_PER_DAY
+    scored = events[["user_id", "ad_id"]].assign(score=events.weight * 0.5 ** (age_days / half_life_days))
+    scored = scored.groupby(["user_id", "ad_id"], as_index=False).score.sum()
+    return scored.sort_values(["user_id", "score", "ad_id"], ascending=[True, False, True])
+
+
 class HistoryGenerator(Generator):
     """Объявления из истории пользователя: вес события затухает с давностью.
 
@@ -53,11 +65,8 @@ class HistoryGenerator(Generator):
         self.half_life_days = half_life_days
 
     def _fit(self, events: pd.DataFrame) -> None:
-        """Складывает затухающие веса по парам и сортирует объявления каждого пользователя."""
-        age_days = (self.cutoff - events.ts).dt.total_seconds() / SECONDS_PER_DAY
-        scored = events[["user_id", "ad_id"]].assign(score=events.weight * 0.5 ** (age_days / self.half_life_days))
-        scored = scored.groupby(["user_id", "ad_id"], as_index=False).score.sum()
-        scored = scored.sort_values(["user_id", "score", "ad_id"], ascending=[True, False, True])
+        """Запоминает объявления каждого пользователя в порядке убывания скора."""
+        scored = _decayed_scores(events, self.cutoff, self.half_life_days)
         self.user_ads = scored.groupby("user_id").ad_id.agg(list).to_dict()
 
     def recommend(self, users: Sequence[int], k: int) -> dict[int, list[int]]:
@@ -145,6 +154,82 @@ class SegmentPopularGenerator(Generator):
         ads = np.concatenate([part[0] for part in parts])
         scores = np.concatenate([part[1] for part in parts])
         return ads[np.lexsort((ads, -scores))][:k].tolist()
+
+
+class Item2ItemGenerator(Generator):
+    """Похожие объявления: два объявления похожи, если их смотрели одни и те же пользователи.
+
+    Сходство косинусное: c / (sqrt(n_i * n_j) + shrink), где c это число общих пользователей, а n это
+    число пользователей объявления. shrink снижает сходство пар с малым числом наблюдений.
+    Скор кандидата равен сумме сходств с объявлениями пользователя, умноженных на их затухающий вес.
+    Активные пользователи ограничены max_user_ads лучшими объявлениями: иначе число пар растёт квадратично.
+    С exclude_seen=True просмотренное не предлагается: его уже покрывает HistoryGenerator.
+    """
+
+    def __init__(
+        self,
+        half_life_days: float = 3.0,
+        max_user_ads: int = 50,
+        top_neighbors: int = 50,
+        shrink: float = 0.0,
+        exclude_seen: bool = True,
+        batch_size: int = 2_000,
+    ):
+        """Запоминает параметры обучения и размер пачки пользователей в recommend."""
+        self.half_life_days = half_life_days
+        self.max_user_ads = max_user_ads
+        self.top_neighbors = top_neighbors
+        self.shrink = shrink
+        self.exclude_seen = exclude_seen
+        self.batch_size = batch_size
+
+    def _fit(self, events: pd.DataFrame) -> None:
+        """Строит матрицу весов пользователь-объявление и матрицу сходства объявлений."""
+        scored = _decayed_scores(events, self.cutoff, self.half_life_days)
+        scored = scored.groupby("user_id").head(self.max_user_ads)
+
+        user_rows, users = pd.factorize(scored.user_id, sort=True)
+        ad_cols, self.ads = pd.factorize(scored.ad_id, sort=True)
+        shape = (len(users), len(self.ads))
+        self.user_index = {user: row for row, user in enumerate(users.tolist())}
+        self.user_weights = sp.csr_matrix((scored.score.to_numpy(), (user_rows, ad_cols)), shape=shape)
+        seen = sp.csr_matrix((np.ones(len(scored), dtype=np.int32), (user_rows, ad_cols)), shape=shape)
+        self.similarity = self._build_similarity(seen)
+
+    def _build_similarity(self, seen: sp.csr_matrix) -> sp.csr_matrix:
+        """Считает косинусное сходство и оставляет top_neighbors соседей у каждого объявления."""
+        co_views = (seen.T @ seen).tocoo()
+        off_diagonal = co_views.row != co_views.col
+        rows, cols = co_views.row[off_diagonal], co_views.col[off_diagonal]
+        ad_users = np.asarray(seen.sum(axis=0)).ravel().astype(np.float64)
+        scores = co_views.data[off_diagonal] / (np.sqrt(ad_users[rows] * ad_users[cols]) + self.shrink)
+
+        order = np.lexsort((cols, -scores, rows))
+        rows, cols, scores = rows[order], cols[order], scores[order]
+        row_starts = np.searchsorted(rows, rows, side="left")
+        keep = np.arange(len(rows)) - row_starts < self.top_neighbors
+        return sp.csr_matrix((scores[keep], (rows[keep], cols[keep])), shape=co_views.shape)
+
+    def recommend(self, users: Sequence[int], k: int) -> dict[int, list[int]]:
+        """Считает скоры пачками, чтобы не держать в памяти большое произведение матриц."""
+        known = [user for user in users if user in self.user_index]
+        recs: dict[int, list[int]] = {user: [] for user in users}
+        for start in range(0, len(known), self.batch_size):
+            batch = known[start : start + self.batch_size]
+            weights = self.user_weights[[self.user_index[user] for user in batch]]
+            scores = (weights @ self.similarity).tocsr()
+            for row, user in enumerate(batch):
+                recs[user] = self._top_ads(scores, weights, row, k)
+        return recs
+
+    def _top_ads(self, scores: sp.csr_matrix, weights: sp.csr_matrix, row: int, k: int) -> list[int]:
+        """Выбирает k лучших объявлений из строки скоров."""
+        cols = scores.indices[scores.indptr[row] : scores.indptr[row + 1]]
+        values = scores.data[scores.indptr[row] : scores.indptr[row + 1]]
+        if self.exclude_seen:
+            fresh = ~np.isin(cols, weights.indices[weights.indptr[row] : weights.indptr[row + 1]])
+            cols, values = cols[fresh], values[fresh]
+        return self.ads[cols[np.lexsort((cols, -values))[:k]]].tolist()
 
 
 class BlendGenerator(Generator):

@@ -16,13 +16,6 @@ from avito_recsys.generators import (
 METRICS = ["MAP@12", "NDCG@12", "Recall@12", "Recall@50", "Recall@100", "Recall@200"]
 
 
-def load_ads() -> pd.DataFrame:
-    """Читает категорию и регион каждого объявления."""
-    ads = data.load_table("AdsInfo")[["AdID", "CategoryID", "LocationID"]]
-    locations = data.load_table("Location")[["LocationID", "RegionID"]]
-    return ads.merge(locations, on="LocationID", how="left")
-
-
 def build_generators(ads: pd.DataFrame) -> dict[str, Generator]:
     """Собирает отдельные бейзлайны с разными параметрами и их склейки."""
     category = ["CategoryID"]
@@ -50,7 +43,7 @@ def main() -> None:
     interactions = data.load_interactions()
     val = data.load_task_table("val")
     rows = {}
-    for name, generator in build_generators(load_ads()).items():
+    for name, generator in build_generators(data.load_ads()).items():
         start = time.perf_counter()
         rows[name] = evaluate(generator, interactions, val)
         print(f"{name}: {time.perf_counter() - start:.1f}s MAP@12={rows[name]['MAP@12']:.4f}", flush=True)
