@@ -1,0 +1,20 @@
+# Окружение
+.venv/
+
+# Данные (скачиваются scripts/download_data.py)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Локальное
+.DS_Store
+.vscode/
+.idea/
+.claude/
+CLAUDE.md
