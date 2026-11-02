@@ -3,6 +3,7 @@ import pytest
 
 from avito_recsys.evaluate import evaluate
 from avito_recsys.generators import (
+    ALSGenerator,
     BlendGenerator,
     HistoryGenerator,
     Item2ItemGenerator,
@@ -166,6 +167,61 @@ def test_item2item_unknown_user_and_batches():
     assert recs[9] == []
     assert recs[4] == [2, 3]
     assert recs[1] == [3]
+
+
+def two_block_events() -> pd.DataFrame:
+    """Две группы вкусов: пользователи 1-20 смотрят объявления 1-5, пользователи 21-40 смотрят 6-10.
+
+    Пользователь 1 не видел объявление 5, а пользователь 21 не видел объявление 10.
+    """
+    rows = []
+    for user in range(1, 21):
+        rows += [(user, ad, 1, 1.0) for ad in range(1, 6) if not (user == 1 and ad == 5)]
+    for user in range(21, 41):
+        rows += [(user, ad, 1, 1.0) for ad in range(6, 11) if not (user == 21 and ad == 10)]
+    return make_events(rows)
+
+
+def small_als(**kwargs) -> ALSGenerator:
+    """Создаёт маленькую модель для тестов."""
+    return ALSGenerator(factors=4, regularization=0.1, iterations=10, num_threads=1, **kwargs)
+
+
+def test_als_recommends_inside_user_taste():
+    generator = small_als().fit(two_block_events(), CUTOFF)
+    recs = generator.recommend([1, 21], 1)
+    assert recs[1] == [5]
+    assert recs[21] == [10]
+
+
+def test_als_excludes_seen_and_has_no_duplicates():
+    generator = small_als().fit(two_block_events(), CUTOFF)
+    recs = generator.recommend([1], 100)[1]
+    assert not {1, 2, 3, 4} & set(recs)
+    assert len(recs) == len(set(recs)) == 6
+
+
+def test_als_can_keep_seen_ads():
+    generator = small_als(exclude_seen=False).fit(two_block_events(), CUTOFF)
+    assert set(generator.recommend([1], 5)[1]) == {1, 2, 3, 4, 5}
+
+
+def test_als_drops_ads_with_too_few_users():
+    events = pd.concat([two_block_events(), make_events([(1, 99, 1, 1.0)])])
+    generator = small_als().fit(events, CUTOFF)
+    assert 99 not in generator.ads
+
+
+def test_als_ignores_future_events():
+    events = pd.concat([two_block_events(), make_events([(1, 77, 0, 1.0), (2, 77, -1, 1.0)])])
+    generator = small_als().fit(events, CUTOFF)
+    assert 77 not in generator.ads
+
+
+def test_als_unknown_user_gets_nothing_and_batches_work():
+    generator = small_als(batch_size=1).fit(two_block_events(), CUTOFF)
+    recs = generator.recommend([999, 1, 21], 1)
+    assert recs == {999: [], 1: [5], 21: [10]}
 
 
 def test_blend_fills_without_duplicates_and_cuts_to_k():

@@ -12,6 +12,7 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from implicit.als import AlternatingLeastSquares
 
 SECONDS_PER_DAY = 86_400
 
@@ -230,6 +231,86 @@ class Item2ItemGenerator(Generator):
             fresh = ~np.isin(cols, weights.indices[weights.indptr[row] : weights.indptr[row + 1]])
             cols, values = cols[fresh], values[fresh]
         return self.ads[cols[np.lexsort((cols, -values))[:k]]].tolist()
+
+
+class ALSGenerator(Generator):
+    """Матричная факторизация implicit ALS: скор равен скалярному произведению векторов пользователя и объявления.
+
+    Уверенность в паре растёт с затухающим весом её событий. Объявления, которые смотрело меньше
+    min_ad_users пользователей, не участвуют: связей с другими пользователями у них нет.
+    С exclude_seen=True просмотренное не предлагается: его уже покрывает HistoryGenerator.
+    """
+
+    def __init__(
+        self,
+        factors: int = 64,
+        regularization: float = 10.0,
+        alpha: float = 40.0,
+        iterations: int = 15,
+        half_life_days: float = 3.0,
+        min_ad_users: int = 2,
+        exclude_seen: bool = True,
+        num_threads: int = 4,
+        batch_size: int = 500,
+        seed: int = 42,
+    ):
+        """Запоминает параметры модели и размер пачки пользователей в recommend."""
+        self.factors = factors
+        self.regularization = regularization
+        self.alpha = alpha
+        self.iterations = iterations
+        self.half_life_days = half_life_days
+        self.min_ad_users = min_ad_users
+        self.exclude_seen = exclude_seen
+        self.num_threads = num_threads
+        self.batch_size = batch_size
+        self.seed = seed
+
+    def _fit(self, events: pd.DataFrame) -> None:
+        """Строит матрицу пользователь-объявление и обучает векторы."""
+        scored = _decayed_scores(events, self.cutoff, self.half_life_days)
+        ad_users = scored.ad_id.map(scored.ad_id.value_counts())
+        scored = scored[ad_users >= self.min_ad_users]
+
+        user_rows, users = pd.factorize(scored.user_id, sort=True)
+        ad_cols, self.ads = pd.factorize(scored.ad_id, sort=True)
+        self.user_index = {user: row for row, user in enumerate(users.tolist())}
+        self.user_items = sp.csr_matrix(
+            (scored.score.to_numpy(dtype=np.float32), (user_rows, ad_cols)),
+            shape=(len(users), len(self.ads)),
+        )
+        model = AlternatingLeastSquares(
+            factors=self.factors,
+            regularization=self.regularization,
+            alpha=self.alpha,
+            iterations=self.iterations,
+            num_threads=self.num_threads,
+            random_state=self.seed,
+        )
+        model.fit(self.user_items, show_progress=False)
+        self.user_factors = model.user_factors
+        self.ad_factors = model.item_factors
+
+    def recommend(self, users: Sequence[int], k: int) -> dict[int, list[int]]:
+        """Считает скоры всех объявлений пачками, чтобы плотная матрица скоров помещалась в память."""
+        known = [user for user in users if user in self.user_index]
+        recs: dict[int, list[int]] = {user: [] for user in users}
+        top = min(k, len(self.ads))
+        if top == 0:
+            return recs
+        for start in range(0, len(known), self.batch_size):
+            batch = known[start : start + self.batch_size]
+            rows = [self.user_index[user] for user in batch]
+            scores = self.user_factors[rows] @ self.ad_factors.T
+            if self.exclude_seen:
+                seen = self.user_items[rows].tocoo()
+                scores[seen.row, seen.col] = -np.inf
+            best = np.argpartition(-scores, top - 1, axis=1)[:, :top]
+            for row, user in enumerate(batch):
+                row_best = best[row][np.isfinite(scores[row, best[row]])]
+                ranked = row_best[np.lexsort((row_best, -scores[row, row_best]))]
+                recs[user] = self.ads[ranked].tolist()
+        return recs
 
 
 class BlendGenerator(Generator):
