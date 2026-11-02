@@ -1,13 +1,10 @@
-"""Скачивает rel-avito, сохраняет в parquet и собирает таблицу взаимодействий.
-
-Повторный запуск не качает данные заново. Флаг --force перекачивает их.
-"""
 import argparse
 
 from avito_recsys import config, data
 
 
 def main() -> None:
+    """Скачивает данные, если их ещё нет, и собирает таблицу взаимодействий."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="download again even if data exists")
     args = parser.parse_args()

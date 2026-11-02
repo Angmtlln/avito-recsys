@@ -18,6 +18,7 @@ from avito_recsys import config
 
 
 def download(dataset_name: str = config.DATASET_NAME, task_name: str = config.TASK_NAME) -> None:
+    """Скачивает датасет и задачу из RelBench и сохраняет их в parquet и meta.json."""
     import relbench  # импорт здесь, чтобы остальной код не зависел от relbench
 
     ds = relbench.load_dataset(dataset_name)
@@ -59,18 +60,22 @@ def download(dataset_name: str = config.DATASET_NAME, task_name: str = config.TA
 
 
 def load_meta() -> dict:
+    """Читает ключи, колонки времени и параметры задачи из meta.json."""
     return json.loads((config.RAW_DIR / "meta.json").read_text())
 
 
 def load_table(name: str) -> pd.DataFrame:
+    """Читает таблицу базы по имени."""
     return pd.read_parquet(config.RAW_DIR / "db" / f"{name}.parquet")
 
 
 def load_task_table(split: str) -> pd.DataFrame:
+    """Читает таблицу задачи для сплита train, val или test."""
     return pd.read_parquet(config.RAW_DIR / "task" / f"{split}.parquet")
 
 
 def _fkey_col(table_meta: dict, target_table: str) -> str:
+    """Возвращает колонку внешнего ключа на target_table, ошибка если она не единственная."""
     cols = [c for c, t in table_meta["fkeys"].items() if t == target_table]
     if len(cols) != 1:
         raise ValueError(f"expected one fkey to {target_table}, got {cols}")
@@ -107,6 +112,7 @@ def build_interactions(tables: dict[str, pd.DataFrame], meta: dict) -> pd.DataFr
 
 
 def prepare() -> pd.DataFrame:
+    """Собирает таблицу взаимодействий из сырых данных и сохраняет её в parquet."""
     meta = load_meta()
     tables = {name: load_table(name) for name in config.EVENT_TABLES}
     interactions = build_interactions(tables, meta)
@@ -116,4 +122,5 @@ def prepare() -> pd.DataFrame:
 
 
 def load_interactions() -> pd.DataFrame:
+    """Читает готовую таблицу взаимодействий."""
     return pd.read_parquet(config.PROCESSED_DIR / "interactions.parquet")
